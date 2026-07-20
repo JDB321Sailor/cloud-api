@@ -114,7 +114,9 @@ The script prompts for everything it needs; collect these values first:
 
 Before choosing the OIDC values, register the redirect URI
 `https://<api-domain>/oidc/callback` with the provider — see
-[OIDC provider configuration](#oidc-provider-configuration).
+[OIDC provider configuration](#oidc-provider-configuration). Note the redirect
+URI uses the **API** domain (`api.example.com`), not the dashboard/app domain
+(`app.example.com`), even though you sign in via the dashboard.
 
 ## What setup-deployment.sh does
 
@@ -184,6 +186,46 @@ The API performs the authorization-code flow with PKCE and redirects back to
 `https://<api-domain>/oidc/callback` — that is the **redirect URI** to
 register with every provider. Users must also be permitted by
 `ALLOWED_IDENTITIES` when that list is non-empty.
+
+> [!IMPORTANT]
+> **The redirect URI must use the API domain, NOT the dashboard (APP) domain.**
+> This is an easy mistake to make: you open the dashboard at
+> `https://app.example.com` to sign in, so it feels natural to register that
+> host with the provider. But the OAuth callback is served by the **API**, so
+> the redirect URI you enter in the OIDC client is:
+>
+> ```
+> https://api.example.com/oidc/callback
+> ```
+>
+> **not** `https://app.example.com/oidc/callback`. The value is derived in code
+> from the `API_HOSTNAME` environment variable (`src/oidc.ts`:
+> `REDIRECT_URI = ${API_HOSTNAME}/oidc/callback`), which the script sets to
+> `https://<api-domain>`. Registering the app domain instead produces a
+> `redirect_uri` mismatch and every sign-in fails.
+
+### All OIDC-related environment variables set by the script
+
+Beyond the four provider values above, the script writes the supporting
+variables the OIDC flow depends on into `deploy/.env`. The example values below
+use `app.example.com` (dashboard) and `api.example.com` (API):
+
+| Variable | Consumed by | Example value | Purpose |
+|----------|-------------|---------------|---------|
+| `OIDC_ISSUER` | `oidc-config.ts` `getOidcIssuerUrl` | `https://auth.example.com/application/o/jetkvm/` | Issuer for discovery; **must exactly match** the `issuer` field returned by `/.well-known/openid-configuration` |
+| `OIDC_CLIENT_ID` | `oidc-config.ts` `getOidcClientId` | `<client-id>` | OAuth client ID from the provider |
+| `OIDC_CLIENT_SECRET` | `oidc-config.ts` `getOidcClientSecret` | `<client-secret>` | OAuth client secret from the provider |
+| `OIDC_SCOPES` | `oidc-config.ts` `getOidcScopes` | `openid email profile` | Requested scopes (default when unset) |
+| `API_HOSTNAME` | `oidc.ts` `REDIRECT_URI` | `https://api.example.com` | **Drives the redirect URI** `${API_HOSTNAME}/oidc/callback` — must be the API domain, no trailing slash |
+| `APP_HOSTNAME` | `oidc.ts` `normalizeReturnTo` | `https://app.example.com` | Dashboard origin used to validate post-login `returnTo` redirects |
+| `CORS_ORIGINS` | CORS middleware | `https://app.example.com` | Allowed browser origins for API calls from the dashboard |
+| `COOKIE_SECRET` | session middleware | `<generated hex>` | Signs the session cookie that stores the CSRF token and PKCE `code_verifier` during the login round-trip |
+
+If `API_HOSTNAME` and the registered redirect URI disagree, the provider
+rejects the callback; if `OIDC_ISSUER` and the discovery document's `issuer`
+disagree, issuer validation fails after the callback. The script keeps both in
+sync automatically — the redirect URI it prints during setup is built from the
+same `API_DOMAIN` answer that becomes `API_HOSTNAME`.
 
 ### Google
 

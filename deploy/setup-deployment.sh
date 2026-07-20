@@ -304,6 +304,8 @@ S1
         _a JETKVM_SETUP_ACME_EMAIL
         printf '%s\n' "# Cloudflare DNS API token with Zone:DNS:Edit permission  (dns-01 only)"
         _a CF_DNS_API_TOKEN
+        printf '%s\n' "# DNS-01 propagation-check resolvers, comma-separated host:port  (dns-01 only; default 1.1.1.1:53,8.8.8.8:53)"
+        _a JETKVM_SETUP_ACME_RESOLVERS
         cat <<'S2'
 
 # ---------------------------------------------------------------------------
@@ -379,6 +381,30 @@ check_prereqs() {
 }
 
 # ---------------------------------------------------------------------------
+# UI build-context fix-up. The kvm/ui checkout ships some public/ assets as
+# symlinks that point outside the ui/ directory (e.g.
+# public/sse.html -> ../../internal/logging/sse.html). The dashboard image is
+# built with ui/ as its Docker build context, so those links arrive dangling
+# inside the image and Vite's build aborts with:
+#   Error: ENOENT: no such file or directory, stat '/ui/public/sse.html'
+# Replace each such symlink with a real copy of its target so the build
+# context is self-contained. Idempotent: reruns find no symlinks to fix.
+# ---------------------------------------------------------------------------
+materialize_ui_symlinks() {
+    local ui_dir="$SRC_UI_DIR" link target
+    [ -d "$ui_dir" ] || return 0
+    while IFS= read -r -d '' link; do
+        if target="$(readlink -f "$link" 2>/dev/null)" && [ -f "$target" ]; then
+            info "Materializing symlinked UI asset for the build context: ${link#"$KVM_DIR"/}"
+            rm -f "$link"
+            cp "$target" "$link"
+        else
+            warn "Unresolved symlink in UI checkout left as-is (build may fail): $link"
+        fi
+    done < <(find "$ui_dir" \( -name node_modules -o -name .git \) -prune -o -type l -print0)
+}
+
+# ---------------------------------------------------------------------------
 # Domains and TLS. Traefik terminates HTTPS for both hostnames; certificates
 # come from Let's Encrypt (HTTP-01 or Cloudflare DNS-01) or from Traefik's
 # built-in self-signed certificate for internal-only deployments.
@@ -402,6 +428,12 @@ section_domains() {
             info "DNS-01 issues certificates without inbound port 80; both hostnames must be Cloudflare-managed DNS records."
             prompt_value ACME_EMAIL JETKVM_SETUP_ACME_EMAIL "Email address for Let's Encrypt registration"
             prompt_value CF_TOKEN CF_DNS_API_TOKEN "Cloudflare DNS API token (Zone:DNS:Edit for the domain)"
+            info "Traefik verifies the _acme-challenge TXT record has propagated before Let's Encrypt validates it."
+            info "Inside a container the default resolver is Docker's internal DNS (127.0.0.11), which cannot see the"
+            info "public record and stalls issuance; these public resolvers perform the check instead. Press Enter to"
+            info "accept the default, or supply your own comma-separated host:port resolvers."
+            prompt_value ACME_RESOLVERS JETKVM_SETUP_ACME_RESOLVERS \
+                "DNS propagation-check resolvers (comma-separated host:port)" "1.1.1.1:53,8.8.8.8:53"
             ;;
         internal)
             warn "internal mode serves a self-signed certificate; browsers and the JetKVM device must be told to trust it."
@@ -506,10 +538,18 @@ write_compose() {
             ;;
         dns-01)
             resolver_labels=$'\n      - "traefik.http.routers.__NAME__.tls.certresolver=letsencrypt"'
+            # resolvers=: lego verifies the _acme-challenge TXT record has
+            # propagated before asking Let's Encrypt to validate. Inside a
+            # container /etc/resolv.conf points at Docker's embedded resolver
+            # (127.0.0.11), which returns NXDOMAIN for the public record and
+            # loops forever. The resolvers chosen at prompt time (default
+            # 1.1.1.1:53,8.8.8.8:53) make the check query real nameservers so
+            # issuance completes.
             acme_config='      - "--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL}"
       - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
       - "--certificatesresolvers.letsencrypt.acme.dnschallenge=true"
       - "--certificatesresolvers.letsencrypt.acme.dnschallenge.provider=cloudflare"'
+            acme_config+=$'\n'"      - \"--certificatesresolvers.letsencrypt.acme.dnschallenge.resolvers=${ACME_RESOLVERS}\""
             traefik_env='    environment:
       CF_DNS_API_TOKEN: ${CF_DNS_API_TOKEN}'
             ;;
@@ -529,10 +569,15 @@ networks:
     driver: bridge
 
 services:
+  # Traefik must be v3.6+; earlier v3.x images bundle a Docker API client that
+  # defaults to API version 1.24 and only negotiates downward, so it cannot
+  # talk to modern Docker daemons (Engine 25+, minimum API 1.40) and fails with
+  # "client version 1.24 is too old. Minimum supported API version is 1.40".
   traefik:
-    image: traefik:v3.3
+    image: traefik:v3.7
     restart: unless-stopped
     command:
+      - "--log.level=INFO"
       - "--providers.docker=true"
       - "--providers.docker.exposedbydefault=false"
       - "--entrypoints.web.address=:80"
@@ -826,6 +871,10 @@ main() {
     echo
 
     check_prereqs
+
+    # Ensure the sibling kvm/ui checkout is a self-contained Docker build
+    # context before generating compose (see materialize_ui_symlinks).
+    materialize_ui_symlinks
 
     # Load the persistent answers file before any prompts so that prior
     # answers serve as defaults and AUTORUN=true skips all interactive input.
