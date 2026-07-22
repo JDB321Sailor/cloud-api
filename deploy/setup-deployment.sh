@@ -2,6 +2,7 @@
 # Interactive builder for a Docker-based self-hosted JetKVM cloud dashboard.
 #
 # Produces every file needed to run the stack in this folder:
+#   .gitignore            keeps all generated deployment files out of git
 #   compose.yaml          full stack: Traefik, cloud API, Postgres, dashboard UI
 #   Caddyfile             static file server config for the built dashboard UI
 #   .env                  secrets, domains, and OIDC settings (chmod 600)
@@ -21,6 +22,7 @@ KVM_DIR="$REPO_DIR/../kvm"
 SRC_DOCKERFILE="$REPO_DIR/Dockerfile"
 SRC_UI_DIR="$KVM_DIR/ui"
 
+OUT_GITIGNORE="$SCRIPT_DIR/.gitignore"
 OUT_COMPOSE="$SCRIPT_DIR/compose.yaml"
 OUT_CADDYFILE="$SCRIPT_DIR/Caddyfile"
 OUT_ENV="$SCRIPT_DIR/.env"
@@ -43,7 +45,10 @@ warn() { printf '%swarning:%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
 die() { printf '%serror:%s %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 # Returns true when the script must not attempt interactive prompts.
-_no_tty() { [ "$AUTORUN" = "true" ] || [ ! -r /dev/tty ]; }
+# A permission test on /dev/tty is not enough: without a controlling
+# terminal (cron, CI, setsid) the node is readable but opening it fails,
+# so probe with a real open.
+_no_tty() { [ "$AUTORUN" = "true" ] || ! { : </dev/tty; } 2>/dev/null; }
 
 on_error() {
     local rc=$?
@@ -381,14 +386,10 @@ check_prereqs() {
 }
 
 # ---------------------------------------------------------------------------
-# UI build-context fix-up. The kvm/ui checkout ships some public/ assets as
-# symlinks that point outside the ui/ directory (e.g.
-# public/sse.html -> ../../internal/logging/sse.html). The dashboard image is
-# built with ui/ as its Docker build context, so those links arrive dangling
-# inside the image and Vite's build aborts with:
-#   Error: ENOENT: no such file or directory, stat '/ui/public/sse.html'
-# Replace each such symlink with a real copy of its target so the build
-# context is self-contained. Idempotent: reruns find no symlinks to fix.
+# The kvm/ui checkout ships some public/ assets as symlinks pointing outside
+# ui/, which is the dashboard image's Docker build context, so they arrive
+# dangling and the Vite build fails with ENOENT. Replace each with a real
+# copy of its target so the context is self-contained. Idempotent.
 # ---------------------------------------------------------------------------
 materialize_ui_symlinks() {
     local ui_dir="$SRC_UI_DIR" link target
@@ -428,10 +429,8 @@ section_domains() {
             info "DNS-01 issues certificates without inbound port 80; both hostnames must be Cloudflare-managed DNS records."
             prompt_value ACME_EMAIL JETKVM_SETUP_ACME_EMAIL "Email address for Let's Encrypt registration"
             prompt_value CF_TOKEN CF_DNS_API_TOKEN "Cloudflare DNS API token (Zone:DNS:Edit for the domain)"
-            info "Traefik verifies the _acme-challenge TXT record has propagated before Let's Encrypt validates it."
-            info "Inside a container the default resolver is Docker's internal DNS (127.0.0.11), which cannot see the"
-            info "public record and stalls issuance; these public resolvers perform the check instead. Press Enter to"
-            info "accept the default, or supply your own comma-separated host:port resolvers."
+            info "Traefik checks _acme-challenge TXT propagation before validation; a container's default resolver"
+            info "(Docker's 127.0.0.11) cannot see public records, so public resolvers must perform that check."
             prompt_value ACME_RESOLVERS JETKVM_SETUP_ACME_RESOLVERS \
                 "DNS propagation-check resolvers (comma-separated host:port)" "1.1.1.1:53,8.8.8.8:53"
             ;;
@@ -524,13 +523,14 @@ section_extras() {
 write_compose() {
     info "Writing $OUT_COMPOSE"
 
-    local resolver_labels="" acme_config="" traefik_env=""
+    local resolver_labels="" acme_config="" traefik_env="" acme_mount=""
     # Compose-style ${VAR} placeholders below are expanded by docker compose
     # from the generated .env at runtime, not by this script.
     # shellcheck disable=SC2016
     case "$TLS_MODE" in
         http-01)
             resolver_labels=$'\n      - "traefik.http.routers.__NAME__.tls.certresolver=letsencrypt"'
+            acme_mount=$'\n      - ./letsencrypt:/letsencrypt'
             acme_config='      - "--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL}"
       - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
       - "--certificatesresolvers.letsencrypt.acme.httpchallenge=true"
@@ -538,13 +538,10 @@ write_compose() {
             ;;
         dns-01)
             resolver_labels=$'\n      - "traefik.http.routers.__NAME__.tls.certresolver=letsencrypt"'
-            # resolvers=: lego verifies the _acme-challenge TXT record has
-            # propagated before asking Let's Encrypt to validate. Inside a
-            # container /etc/resolv.conf points at Docker's embedded resolver
-            # (127.0.0.11), which returns NXDOMAIN for the public record and
-            # loops forever. The resolvers chosen at prompt time (default
-            # 1.1.1.1:53,8.8.8.8:53) make the check query real nameservers so
-            # issuance completes.
+            acme_mount=$'\n      - ./letsencrypt:/letsencrypt'
+            # resolvers=: the propagation pre-check must query public DNS; a
+            # container's default resolver (Docker's 127.0.0.11) cannot see the
+            # public _acme-challenge record and issuance stalls forever.
             acme_config='      - "--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL}"
       - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
       - "--certificatesresolvers.letsencrypt.acme.dnschallenge=true"
@@ -594,8 +591,7 @@ EOF
     networks:
       - jetkvm
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./letsencrypt:/letsencrypt
+      - /var/run/docker.sock:/var/run/docker.sock:ro$acme_mount
 
   db:
     image: postgres:16
@@ -688,6 +684,24 @@ volumes:
     driver: local
 EOF
     } >"$OUT_COMPOSE"
+}
+
+# ---------------------------------------------------------------------------
+# The generated deployment files contain secrets and host-specific data; a
+# local .gitignore keeps every one of them (itself included) out of git.
+# ---------------------------------------------------------------------------
+write_gitignore() {
+    info "Writing $OUT_GITIGNORE"
+    cat >"$OUT_GITIGNORE" <<'EOF'
+# Generated by setup-deployment.sh. These deployment files contain secrets
+# and host-specific data — never commit them.
+.gitignore
+compose.yaml
+Caddyfile
+.env
+setup-deployment.env
+letsencrypt/
+EOF
 }
 
 write_caddyfile() {
@@ -886,6 +900,7 @@ main() {
     section_oidc
     section_extras
 
+    write_gitignore
     write_compose
     write_caddyfile
     write_env_file

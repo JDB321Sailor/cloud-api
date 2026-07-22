@@ -144,6 +144,9 @@ The script is an idempotent, rerunnable builder. Section by section:
    (`ALLOWED_IDENTITIES`), custom ICE servers (`ICE_SERVERS`), and Cloudflare
    TURN credentials (`CLOUDFLARE_TURN_ID` / `CLOUDFLARE_TURN_TOKEN`).
 6. **File generation** — writes into `deploy/`:
+   - `.gitignore` — written first; keeps every generated deployment file
+     (itself included) out of git, since they contain secrets and
+     host-specific data.
    - `compose.yaml` — the full stack (Traefik, Postgres, API migration job,
      API, dashboard UI). The API is built from this repository's Dockerfile;
      the dashboard image is built from `../../kvm/ui` with
@@ -166,8 +169,10 @@ The script is an idempotent, rerunnable builder. Section by section:
    dashboard URL, and the next steps for the device build.
 
 Generated files (`compose.yaml`, `Caddyfile`, `.env`,
-`setup-deployment.env`, `letsencrypt/`) contain deployment-specific data and
-secrets — never commit them.
+`setup-deployment.env`, and — in the Let's Encrypt modes — `letsencrypt/`)
+contain deployment-specific data and secrets. The script writes a
+`deploy/.gitignore` covering all of them, so git ignores them automatically —
+never commit them.
 
 ## OIDC provider configuration
 
@@ -323,7 +328,7 @@ minutes. Verify:
 
 ```sh
 docker compose ps
-curl -fsS https://api.example.com/healthz    # → OK
+curl -fsS https://api.example.com/healthz    # → {"ready":true,"time":"..."}
 ```
 
 Then open `https://app.example.com` and sign in through the OIDC provider.
